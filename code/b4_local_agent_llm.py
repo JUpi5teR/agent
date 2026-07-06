@@ -18,6 +18,246 @@ PARSE_ERROR_CONTENT = "模型输出解析失败，无法生成有效工具调用
 _MODEL_CACHE: dict[tuple[str, ...], tuple[Any, Any]] = {}
 
 
+class B4Plugin:
+    """Unified interface for B4 cognitive engine plugins."""
+
+    name = "base"
+
+    def run(self, payload: Any) -> Any:
+        raise NotImplementedError
+
+
+class GoalParserPlugin(B4Plugin):
+    name = "goal_parser"
+
+    def run(self, payload: str) -> dict[str, list[str] | str]:
+        if not isinstance(payload, str) or not payload.strip():
+            raise ValueError("Goal Parser input must be a non-empty natural language goal")
+        text = payload.strip()
+        return {
+            "goal": text,
+            "constraints": self._extract_constraints(text),
+            "resources": self._extract_resources(text),
+            "priority": self._extract_priority(text),
+        }
+
+    def _extract_constraints(self, text: str) -> list[str]:
+        constraints = self._sentences_with_markers(text, ("必须", "不能", "禁止", "要求", "限制", "must", "only"))
+        return constraints or ["保持步骤可执行、可验证"]
+
+    def _extract_resources(self, text: str) -> list[str]:
+        resources = [item.strip() for item in re.findall(r"[“\"]([^”\"]+)[”\"]", text) if item.strip()]
+        resources.extend(self._sentences_with_markers(text, ("资料", "教材", "课程", "工具", "代码", "文档", "resource")))
+        return self._dedupe(resources) or ["用户目标描述"]
+
+    def _extract_priority(self, text: str) -> list[str]:
+        priorities = self._sentences_with_markers(text, ("优先", "重点", "首先", "最重要", "priority", "first"))
+        if "学习路线" in text:
+            priorities.append("先建立学习顺序，再安排练习验证")
+        return self._dedupe(priorities) or ["先完成核心目标，再补充细节"]
+
+    def _sentences_with_markers(self, text: str, markers: tuple[str, ...]) -> list[str]:
+        parts = [part.strip(" \t\r\n，。；;") for part in re.split(r"[。；;\n]+", text)]
+        return self._dedupe([part for part in parts if part and any(marker in part for marker in markers)])
+
+    def _dedupe(self, values: list[str]) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            if value not in result:
+                result.append(value)
+        return result
+
+
+class _TreeOfThoughtsOptimizer:
+    """Planner-internal optimizer: Expand -> Score -> Prune -> Expand."""
+
+    def optimize(self, goal_json: dict[str, Any], initial_plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        expanded = self._expand(goal_json, initial_plan)
+        scored = self._score(goal_json, expanded)
+        pruned = self._prune(scored)
+        final_candidates = self._expand(goal_json, pruned[0]["plan"])
+        return self._score(goal_json, final_candidates)[0]["plan"]
+
+    def _expand(self, goal_json: dict[str, Any], plan: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        candidates = [deepcopy(plan)]
+        with_validation = deepcopy(plan)
+        if not any("验证" in item["task"] or "检查" in item["task"] for item in with_validation):
+            with_validation.append({"id": len(with_validation) + 1, "task": "验证计划是否满足目标、约束和资源条件"})
+        candidates.append(with_validation)
+
+        with_context = deepcopy(plan)
+        if goal_json.get("constraints") or goal_json.get("resources"):
+            with_context.insert(1, {"id": 2, "task": "整理可用资源和约束，形成执行清单"})
+            with_context = self._renumber(with_context)
+        candidates.append(with_context)
+        return candidates
+
+    def _score(self, goal_json: dict[str, Any], candidates: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        scored = []
+        for plan in candidates:
+            tasks = [item.get("task", "") for item in plan]
+            score = min(len(tasks), 6)
+            score += 2 if any("验证" in task or "检查" in task for task in tasks) else 0
+            score += 1 if any("资源" in task or "约束" in task for task in tasks) else 0
+            score += 1 if goal_json.get("goal") else 0
+            score -= len(tasks) - len(set(tasks))
+            scored.append({"score": score, "plan": self._renumber(plan)})
+        return sorted(scored, key=lambda item: item["score"], reverse=True)
+
+    def _prune(self, scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return scored[:2]
+
+    def _renumber(self, plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{"id": index, "task": item["task"]} for index, item in enumerate(plan, 1)]
+
+
+class PlannerPlugin(B4Plugin):
+    name = "planner"
+
+    def __init__(self) -> None:
+        self._tot = _TreeOfThoughtsOptimizer()
+
+    def run(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict) or not payload.get("goal"):
+            raise ValueError("Planner input must be Goal JSON with a goal field")
+        return self._tot.optimize(payload, self._build_initial_plan(payload))
+
+    def _build_initial_plan(self, goal_json: dict[str, Any]) -> list[dict[str, Any]]:
+        goal = str(goal_json["goal"])
+        if "学习路线" in goal:
+            tasks = [
+                "明确学习主题、当前基础和最终验收标准",
+                "列出必须掌握的核心概念并按先后关系排序",
+                "为每个核心概念匹配学习资料和练习任务",
+                "安排阶段性项目或测验来检查掌握程度",
+                "根据检查结果调整后续学习节奏",
+            ]
+        else:
+            tasks = [
+                "明确目标的完成标准和交付物",
+                "拆分目标所需的关键步骤",
+                "按依赖关系执行每个步骤",
+                "检查执行结果是否满足目标",
+            ]
+        return [{"id": index, "task": task} for index, task in enumerate(tasks, 1)]
+
+
+class CriticPlugin(B4Plugin):
+    name = "critic"
+
+    def run(self, payload: dict[str, Any]) -> dict[str, int | str]:
+        if not isinstance(payload, dict):
+            raise ValueError("Critic input must contain plan and goal_json")
+        plan = payload.get("plan")
+        goal_json = payload.get("goal_json")
+        if not isinstance(plan, list) or not isinstance(goal_json, dict):
+            raise ValueError("Critic input must contain plan and goal_json")
+        issues = self._find_issues(plan, goal_json)
+        return {
+            "score": max(0, 10 - len(issues) * 2),
+            "reason": "Plan satisfies goal, constraints, order, and non-duplication checks." if not issues else "; ".join(issues),
+        }
+
+    def _find_issues(self, plan: list[dict[str, Any]], goal_json: dict[str, Any]) -> list[str]:
+        tasks = [item.get("task") for item in plan if isinstance(item, dict)]
+        issues: list[str] = []
+        if not plan:
+            issues.append("plan is empty")
+        if len(tasks) != len(plan) or any(not isinstance(task, str) or not task.strip() for task in tasks):
+            issues.append("plan contains invalid task")
+        if len(tasks) != len(set(tasks)):
+            issues.append("plan contains duplicate task")
+        if not any("验证" in task or "检查" in task for task in tasks if isinstance(task, str)):
+            issues.append("plan misses verification step")
+        if goal_json.get("constraints") and not any("约束" in task or "限制" in task for task in tasks if isinstance(task, str)):
+            issues.append("plan does not explicitly handle constraints")
+        return issues
+
+
+class SchedulerPlugin(B4Plugin):
+    name = "scheduler"
+
+    def run(self, payload: list[dict[str, Any]]) -> list[dict[str, int | str]]:
+        if not isinstance(payload, list):
+            raise ValueError("Scheduler input must be a plan array")
+        schedule = []
+        for order, item in enumerate(sorted(payload, key=lambda task: int(task.get("id", 0))), 1):
+            task = item.get("task")
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError("Scheduler received invalid task")
+            schedule.append({"id": int(item.get("id", order)), "task": task, "order": order})
+        return schedule
+
+
+class ReflectionPlugin(B4Plugin):
+    name = "reflection"
+
+    def run(self, payload: dict[str, Any]) -> dict[str, bool | str]:
+        execution_results = payload.get("execution_results") if isinstance(payload, dict) else None
+        if not isinstance(execution_results, list):
+            raise ValueError("Reflection input must contain execution_results")
+        failed = [item for item in execution_results if not isinstance(item, dict) or item.get("status") != "success"]
+        if failed:
+            return {"success": False, "need_replan": True, "reason": f"{len(failed)} task(s) failed; return to Planner."}
+        return {"success": True, "need_replan": False, "reason": "All scheduled tasks completed successfully."}
+
+
+class B4CognitiveEngine:
+    """Core scheduler for Goal Parser -> Planner/ToT -> Critic -> Scheduler -> Reflection."""
+
+    def __init__(self, max_reflection_rounds: int = 2, critic_threshold: int = 8) -> None:
+        self.max_reflection_rounds = max_reflection_rounds
+        self.critic_threshold = critic_threshold
+        self.plugins = {
+            "goal_parser": GoalParserPlugin(),
+            "planner": PlannerPlugin(),
+            "critic": CriticPlugin(),
+            "scheduler": SchedulerPlugin(),
+            "reflection": ReflectionPlugin(),
+        }
+
+    def run(self, user_goal: str) -> dict[str, Any]:
+        goal_json = self.plugins["goal_parser"].run(user_goal)
+        trace: list[dict[str, Any]] = [{"module": "Goal Parser", "output": goal_json}]
+        plan: list[dict[str, Any]] = []
+        critic_result: dict[str, Any] = {}
+        schedule: list[dict[str, Any]] = []
+        reflection_result: dict[str, Any] = {}
+
+        for round_index in range(1, self.max_reflection_rounds + 1):
+            plan = self.plugins["planner"].run(goal_json)
+            trace.append({"module": "Planner+Tree of Thoughts", "round": round_index, "output": plan})
+            critic_result = self.plugins["critic"].run({"goal_json": goal_json, "plan": plan})
+            trace.append({"module": "Critic", "round": round_index, "output": critic_result})
+            if int(critic_result["score"]) < self.critic_threshold:
+                goal_json = self._add_replan_constraint(goal_json, str(critic_result["reason"]))
+                continue
+            schedule = self.plugins["scheduler"].run(plan)
+            trace.append({"module": "Scheduler", "round": round_index, "output": schedule})
+            reflection_result = self.plugins["reflection"].run({"execution_results": self._execute_schedule(schedule)})
+            trace.append({"module": "Reflection", "round": round_index, "output": reflection_result})
+            if not reflection_result["need_replan"]:
+                break
+            goal_json = self._add_replan_constraint(goal_json, str(reflection_result["reason"]))
+
+        return {
+            "goal_json": goal_json,
+            "plan": plan,
+            "critic": critic_result,
+            "schedule": schedule,
+            "reflection": reflection_result,
+            "trace": trace,
+        }
+
+    def _execute_schedule(self, schedule: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{"id": item["id"], "order": item["order"], "task": item["task"], "status": "success"} for item in schedule]
+
+    def _add_replan_constraint(self, goal_json: dict[str, Any], reason: str) -> dict[str, Any]:
+        updated = dict(goal_json)
+        updated["constraints"] = list(updated.get("constraints") or []) + [f"Replan because: {reason}"]
+        return updated
+
+
 def _load_model_config(model_config: str | Path) -> tuple[Path, dict]:
     path = Path(model_config).resolve()
     config = read_yaml(path)
@@ -415,18 +655,35 @@ def generate_ai_message(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate one AIMessage with a local or mock LLM.")
-    parser.add_argument("--model_config", required=True)
-    parser.add_argument("--messages", required=True)
-    parser.add_argument("--tools_schema", required=True)
-    parser.add_argument("--mode", choices=["mock", "prompt_json"], required=True)
-    parser.add_argument("--outdir", required=True)
+    parser = argparse.ArgumentParser(description="Run B4 cognitive planning or generate one AIMessage.")
+    parser.add_argument("--goal", help="Natural language goal for the B4 Cognitive Engine.")
+    parser.add_argument("--max_rounds", type=int, default=2, help="Maximum reflection rounds for --goal mode.")
+    parser.add_argument("--model_config")
+    parser.add_argument("--messages")
+    parser.add_argument("--tools_schema")
+    parser.add_argument("--mode", choices=["mock", "prompt_json"])
+    parser.add_argument("--outdir")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.goal:
+            from B4.core.engine import B4CognitiveEngine as PackageB4CognitiveEngine
+
+            result = PackageB4CognitiveEngine(max_reflection_rounds=args.max_rounds).run(args.goal)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+
+        missing = [
+            name
+            for name in ("model_config", "messages", "tools_schema", "mode", "outdir")
+            if getattr(args, name) is None
+        ]
+        if missing:
+            raise ValueError("--goal or all legacy LLM arguments are required: " + ", ".join(missing))
+
         outdir = resolve_cli_path(args.outdir)
         generate_ai_message(
             str(resolve_cli_path(args.model_config)),

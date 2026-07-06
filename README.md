@@ -15,6 +15,70 @@
 
 B4的mock模式不真实加载、运行模型，作为无 GPU、无模型或模块联调时的调试模式。`prompt_json`模式则加载本地模型真实运行。
 
+## B4 Cognitive Engine
+
+入口：`code/b4_local_agent_llm.py`
+
+新的 B4 实现为“结构化任务规划与执行系统”，在现有 B4 文件内按插件化职责组织代码：
+
+```text
+code/b4_local_agent_llm.py
+  B4Plugin              统一插件接口
+  GoalParserPlugin      Goal Parser 插件
+  PlannerPlugin         Planner 插件，内部包含 Tree of Thoughts 优化器
+  CriticPlugin          Critic 插件
+  SchedulerPlugin       Scheduler 插件
+  ReflectionPlugin      Reflection 插件
+  B4CognitiveEngine     核心调度器，只由它协调插件通信
+```
+
+固定执行流如下，顺序不可改变：
+
+```text
+Goal Parser
+-> Planner
+-> Tree of Thoughts (Planner 内部优化器)
+-> Critic
+-> Scheduler
+-> Reflection Loop
+```
+
+`Tree of Thoughts` 不是独立插件，也不是独立流程，而是 `PlannerPlugin` 内部的优化器，按 `Expand -> Score -> Prune -> Expand` 优化初始计划。各插件之间不直接调用，只通过 `B4CognitiveEngine` 调度通信。
+
+`GoalParserPlugin` 会额外生成 `decision` 字段，用于判断当前目标应进入哪种模式：
+
+- `direct_answer`：直接回答
+- `reasoning_answer`：推理回答，严格推理部分由 Planner 内部的 Tree of Thoughts 展开候选思路并量化比较
+- `plan`：制定可执行计划
+- `execute`：需要执行任务或调用工具
+
+`decision` 同时包含 `needs_tool`、`reasoning_required`、`answer_mode`、`tool_candidates`、`confidence` 和 `evidence`，用于说明是否需要工具、是否需要推理以及判断依据。
+
+`CriticPlugin` 除了输出总分 `score` 和 `reason`，还会输出量化评估 `metrics`：
+
+- `completeness`
+- `executability`
+- `constraint_fit`
+- `non_duplication`
+- `tool_fit`
+- `reasoning_quality`
+- `issue_penalty`
+
+运行示例：
+
+```bash
+cd code
+python b4_local_agent_llm.py --goal "写一个Python学习路线，必须每一步可执行、可验证，优先安排基础语法和项目练习"
+```
+
+输出为 JSON，包含 `goal_json`、优化后的 `plan`、`critic` 评分、`schedule`、`reflection` 和完整 `trace`。
+
+独立测试：
+
+```bash
+python -m py_compile code/b4_local_agent_llm.py
+```
+
 ## 1. 环境准备
 
 所有模块统一使用项目根目录下的 `requirements.txt`。推荐每位同学新建自己的conda环境，安装步骤如下：
